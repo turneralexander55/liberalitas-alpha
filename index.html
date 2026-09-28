@@ -94,7 +94,16 @@
   .stars { display:flex; gap: 6px; }
   .stars button { width: 44px; height: 44px; border-radius: 12px; background: var(--raised); border:1px solid var(--lineStrong); color: var(--muted); font: 700 16px Manrope, sans-serif; cursor:pointer; }
   .stars button[aria-pressed="true"] { background: var(--gold); color: var(--ink); border-color: var(--gold); }
-  input[type=file] { color: var(--muted); font-size: 14px; }
+  /* Per-item comment and photos: shown only after Works or Problem is picked. */
+  .more { display:flex; flex-direction:column; gap: 10px; }
+  .photos { display:flex; flex-wrap: wrap; gap: 8px; align-items:center; }
+  .shot { position:relative; width: 64px; height: 64px; border-radius: 10px; overflow:hidden; border:1px solid var(--lineStrong); background: var(--bg); flex: none; }
+  .shot img { width:100%; height:100%; object-fit: cover; display:block; }
+  .shot button { position:absolute; top: 2px; right: 2px; width: 26px; height: 26px; border-radius: 50%; border: 0; background: rgba(20,19,15,.85); color: var(--text); font: 700 16px/26px Manrope, sans-serif; padding:0; cursor:pointer; }
+  .addphoto { position:relative; display:inline-flex; align-items:center; gap: 6px; background: transparent; color: var(--goldSoft); border:1px solid var(--lineStrong); border-radius: 999px; padding: 7px 14px; font: 600 14px Manrope, sans-serif; cursor:pointer; min-height: 38px; }
+  .addphoto:focus-within { outline: 2px solid var(--goldSoft); outline-offset: 2px; }
+  .addphoto input { position:absolute; width:1px; height:1px; opacity:0; overflow:hidden; clip: rect(0 0 0 0); }
+  .photos .busy { font-size: 13px; color: var(--muted); }
 
   /* Actions */
   .actions { display:flex; flex-direction:column; gap: 10px; }
@@ -198,7 +207,7 @@
 
   <section aria-labelledby="h-test">
     <h2 id="h-test">3 · What I'd like you to try</h2>
-    <p class="note">Mark each one <strong>Works</strong>, <strong>Problem</strong> or <strong>Skip</strong>. Skip anything you don't care about. If you pick Problem, tell me what you did, what you expected, and what happened instead.</p>
+    <p class="note">Mark each one <strong>Works</strong>, <strong>Problem</strong> or <strong>Skip</strong>. Skip anything you don't care about. After Works or Problem you can add a comment and photos. If you pick Problem, tell me what you did, what you expected, and what happened instead.</p>
     <div id="groups"></div>
   </section>
 
@@ -215,7 +224,10 @@
       <label class="field" for="f-missing">Anything you wish it did?<textarea id="f-missing"></textarea></label>
       <label class="field" for="f-love">What did you like?<textarea id="f-love"></textarea></label>
       <label class="field" for="f-other">Anything else<textarea id="f-other"></textarea></label>
-      <label class="field" for="f-shots">Screenshots<small>Optional. Your phone may attach them when you send; if not, text them to me.</small><input type="file" id="f-shots" accept="image/*" multiple></label>
+      <div class="field" role="group" aria-labelledby="l-otherphotos">
+        <span id="l-otherphotos">Other photos<br><small>Optional. For anything that isn't one of the items above.</small></span>
+        <div id="other-photos"></div>
+      </div>
     </div>
   </section>
 
@@ -294,8 +306,17 @@
   var ALL = [];
   GROUPS.forEach(function (g) { g.items.forEach(function (it) { ALL.push({ group: g, id: g.id + '.' + it[0], what: it[1], how: it[2] }); }); });
 
-  var state = { items: {}, notes: {}, rating: 0, fields: {} };
-  function load() { try { var s = JSON.parse(localStorage.getItem(KEY) || 'null'); if (s && typeof s === 'object') state = Object.assign(state, s); } catch (e) {} }
+  // v2: a note can belong to a Works item too (v1 only kept notes for Problem). Same key, same shape,
+  // so a v1 save loads as is; anything malformed falls back to empty.
+  function fresh() { return { v: 2, items: {}, notes: {}, rating: 0, fields: {} }; }
+  var state = fresh();
+  function obj(x) { return x && typeof x === 'object' && !Array.isArray(x) ? x : {}; }
+  function load() {
+    try {
+      var s = JSON.parse(localStorage.getItem(KEY) || 'null');
+      if (s && typeof s === 'object') state = { v: 2, items: obj(s.items), notes: obj(s.notes), rating: typeof s.rating === 'number' ? s.rating : 0, fields: obj(s.fields) };
+    } catch (e) {}
+  }
   var savedEl = document.getElementById('saved');
   function save() {
     try { localStorage.setItem(KEY, JSON.stringify(state)); savedEl.textContent = 'Saved on this phone'; }
@@ -332,6 +353,114 @@
     row.appendChild(code); row.appendChild(b); box.appendChild(a); box.appendChild(row);
   });
 
+  // Photos. Kept on this phone in IndexedDB (too big for localStorage) and in memory, so Send can
+  // share them straight away. Each is shrunk to a JPEG of at most 1600px when it's added.
+  var MAX_SIDE = 1600, PHOTO_DB = 'liberalitas.alpha.photos', STORE = 'photos';
+  var photos = {}; // item id -> [{ key, blob, url }]
+  var slots = {};  // item id -> render function
+  var db = null, dbOpening = null;
+  function openDb() {
+    if (dbOpening) return dbOpening;
+    dbOpening = new Promise(function (res) {
+      try {
+        var rq = indexedDB.open(PHOTO_DB, 1);
+        rq.onupgradeneeded = function () { rq.result.createObjectStore(STORE, { keyPath: 'key', autoIncrement: true }); };
+        rq.onsuccess = function () { db = rq.result; res(db); };
+        rq.onerror = rq.onblocked = function () { res(null); };
+      } catch (e) { res(null); }
+    });
+    return dbOpening;
+  }
+  function tx(mode, fn) {
+    return openDb().then(function (d) {
+      if (!d) return Promise.reject(new Error('no db'));
+      return new Promise(function (res, rej) {
+        try { var t = d.transaction(STORE, mode); var r = fn(t.objectStore(STORE)); t.oncomplete = function () { res(r && r.result); }; t.onerror = t.onabort = function () { rej(t.error); }; }
+        catch (e) { rej(e); }
+      });
+    });
+  }
+  function photosNotSaved() { savedEl.textContent = 'Photos not saved: send before closing'; }
+  function shrink(file) {
+    return new Promise(function (res) {
+      var url = URL.createObjectURL(file), img = new Image();
+      img.onload = function () {
+        try {
+          var w = img.naturalWidth, h = img.naturalHeight, k = Math.min(1, MAX_SIDE / Math.max(w, h));
+          var c = document.createElement('canvas'); c.width = Math.max(1, Math.round(w * k)); c.height = Math.max(1, Math.round(h * k));
+          var g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height); g.drawImage(img, 0, 0, c.width, c.height);
+          URL.revokeObjectURL(url);
+          c.toBlob(function (b) { res(b || file); }, 'image/jpeg', 0.85);
+        } catch (e) { URL.revokeObjectURL(url); res(file); }
+      };
+      // A format this browser can't draw is kept as it came.
+      img.onerror = function () { URL.revokeObjectURL(url); res(file); };
+      img.src = url;
+    });
+  }
+  function addPhotos(id, files) {
+    return files.reduce(function (p, f) {
+      return p.then(function () { return shrink(f); }).then(function (blob) {
+        var rec = { item: id, blob: blob, at: Date.now() };
+        var entry = { key: null, blob: blob, url: URL.createObjectURL(blob) };
+        (photos[id] = photos[id] || []).push(entry);
+        return tx('readwrite', function (st) { return st.add(rec); }).then(function (key) { entry.key = key; }, photosNotSaved);
+      });
+    }, Promise.resolve());
+  }
+  function removePhoto(id, entry) {
+    var list = photos[id] || [], i = list.indexOf(entry); if (i < 0) return;
+    list.splice(i, 1); URL.revokeObjectURL(entry.url);
+    if (entry.key != null) tx('readwrite', function (st) { return st.delete(entry.key); }).catch(function () {});
+    slots[id]();
+  }
+  function loadPhotos() {
+    return tx('readonly', function (st) { return st.getAll(); }).then(function (rows) {
+      (rows || []).sort(function (a, b) { return a.key - b.key; }).forEach(function (r) {
+        if (!r || !r.blob || typeof r.item !== 'string') return;
+        (photos[r.item] = photos[r.item] || []).push({ key: r.key, blob: r.blob, url: URL.createObjectURL(r.blob) });
+      });
+      Object.keys(slots).forEach(function (id) { slots[id](); });
+    }, function () {});
+  }
+  function clearPhotos() {
+    Object.keys(photos).forEach(function (id) { photos[id].forEach(function (e) { URL.revokeObjectURL(e.url); }); });
+    photos = {};
+    tx('readwrite', function (st) { return st.clear(); }).catch(function () {});
+    Object.keys(slots).forEach(function (id) { slots[id](); });
+  }
+  function ext(blob) { return blob.type === 'image/jpeg' ? 'jpg' : ((blob.type.split('/')[1] || 'img').replace(/[^a-z0-9]/gi, '') || 'img'); }
+  function photoNames(id) { return (photos[id] || []).map(function (e, i) { return id + '-' + (i + 1) + '.' + ext(e.blob); }); }
+  // The thumbnails and "Add photo" button for one item (or 'other' for the loose photos in section 4).
+  function photoSlot(id, what) {
+    var box = document.createElement('div'); box.className = 'photos';
+    var list = document.createElement('div'); list.style.display = 'contents';
+    var add = document.createElement('label'); add.className = 'addphoto';
+    var inp = document.createElement('input'); inp.type = 'file'; inp.accept = 'image/*'; inp.multiple = true;
+    inp.setAttribute('aria-label', 'Add photo: ' + what);
+    add.appendChild(document.createTextNode('Add photo')); add.appendChild(inp);
+    var busy = document.createElement('span'); busy.className = 'busy'; busy.hidden = true; busy.textContent = 'Adding…';
+    inp.addEventListener('change', function () {
+      var files = Array.prototype.slice.call(inp.files || []); inp.value = '';
+      if (!files.length) return;
+      busy.hidden = false;
+      addPhotos(id, files).then(function () { busy.hidden = true; render(); });
+    });
+    function render() {
+      list.innerHTML = '';
+      (photos[id] || []).forEach(function (e, i) {
+        var s = document.createElement('div'); s.className = 'shot';
+        var img = document.createElement('img'); img.src = e.url; img.alt = 'Photo ' + (i + 1);
+        var x = document.createElement('button'); x.type = 'button'; x.textContent = '×'; x.setAttribute('aria-label', 'Remove photo ' + (i + 1));
+        x.addEventListener('click', function () { removePhoto(id, e); });
+        s.appendChild(img); s.appendChild(x); list.appendChild(s);
+      });
+    }
+    slots[id] = render;
+    box.appendChild(list); box.appendChild(add); box.appendChild(busy);
+    return box;
+  }
+
   // Checklist.
   var groupsEl = document.getElementById('groups');
   var LABEL = { ok: 'Works', bad: 'Problem', skip: 'Skip' };
@@ -351,19 +480,25 @@
       var choice = document.createElement('div'); choice.className = 'choice'; choice.setAttribute('role', 'group'); choice.setAttribute('aria-label', it[1]);
       ['ok', 'bad', 'skip'].forEach(function (v) {
         var b = document.createElement('button'); b.type = 'button'; b.dataset.v = v; b.textContent = LABEL[v];
-        b.addEventListener('click', function () { state.items[id] = state.items[id] === v ? undefined : v; paint(); save(); if (state.items[id] === 'bad') ta.focus(); });
+        b.addEventListener('click', function () { state.items[id] = state.items[id] === v ? undefined : v; paint(); save(); if (state.items[id] === 'bad' && !ta.value) ta.focus(); });
         choice.appendChild(b);
       });
-      var lab = document.createElement('label'); lab.className = 'field'; lab.hidden = true;
-      var ta = document.createElement('textarea'); ta.id = 'n-' + id.replace('.', '-'); ta.placeholder = 'What you did, what you expected, what happened';
+      // The comment box and photos appear only once Works or Problem is picked (hidden from the start, no flash).
+      var more = document.createElement('div'); more.className = 'more'; more.hidden = true;
+      var lab = document.createElement('label'); lab.className = 'field';
+      var ta = document.createElement('textarea'); ta.id = 'n-' + id.replace('.', '-');
       ta.value = state.notes[id] || '';
       ta.addEventListener('input', function () { state.notes[id] = ta.value; save(); });
-      lab.setAttribute('for', ta.id); lab.appendChild(document.createTextNode('What happened?')); lab.appendChild(ta);
-      row.appendChild(what); row.appendChild(how); row.appendChild(choice); row.appendChild(lab);
+      var labText = document.createElement('span'); labText.className = 'lt';
+      lab.setAttribute('for', ta.id); lab.appendChild(labText); lab.appendChild(ta);
+      more.appendChild(lab); more.appendChild(photoSlot(id, it[1]));
+      row.appendChild(what); row.appendChild(how); row.appendChild(choice); row.appendChild(more);
       box.appendChild(row);
     });
     groupsEl.appendChild(box);
   });
+
+  document.getElementById('other-photos').appendChild(photoSlot('other', 'other photos'));
 
   // Rating.
   var stars = document.getElementById('stars');
@@ -388,7 +523,11 @@
       var row = document.getElementById('it-' + a.id.replace('.', '-'));
       row.className = 'item' + (v ? ' is-' + v : '');
       row.querySelectorAll('.choice button').forEach(function (b) { b.setAttribute('aria-pressed', String(b.dataset.v === v)); });
-      row.querySelector('label.field').hidden = v !== 'bad';
+      var more = row.querySelector('.more'); more.hidden = v !== 'ok' && v !== 'bad';
+      if (!more.hidden) {
+        more.querySelector('.lt').textContent = v === 'bad' ? 'What happened?' : 'Comment (optional)';
+        more.querySelector('textarea').placeholder = v === 'bad' ? 'What you did, what you expected, what happened' : 'Anything worth telling me';
+      }
     });
     GROUPS.forEach(function (g) {
       var n = g.items.filter(function (it) { return state.items[g.id + '.' + it[0]]; }).length;
@@ -399,7 +538,16 @@
     stars.querySelectorAll('button').forEach(function (b, j) { b.setAttribute('aria-pressed', String(j + 1 <= state.rating)); });
   }
 
-  function report() {
+  // Items whose comment and photos go out: Works or Problem (Skip and unanswered keep theirs on the phone, unsent).
+  function answered(id) { var v = state.items[id]; return v === 'ok' || v === 'bad'; }
+  function sentPhotoIds() { return ALL.filter(function (a) { return answered(a.id) && (photos[a.id] || []).length; }).map(function (a) { return a.id; }).concat((photos.other || []).length ? ['other'] : []); }
+  function photoFiles() {
+    var out = [];
+    sentPhotoIds().forEach(function (id) { var names = photoNames(id); photos[id].forEach(function (e, i) { out.push(new File([e.blob], names[i], { type: e.blob.type || 'image/jpeg' })); }); });
+    return out;
+  }
+  // attached: the photos go along with this report as files. If not, it says which items have them and asks for a text.
+  function report(attached) {
     var f = state.fields, L = [];
     L.push('LIBERALITAS ALPHA FEEDBACK');
     L.push('From: ' + (f.name || '(no name)'));
@@ -408,10 +556,24 @@
     var counts = { ok: 0, bad: 0, skip: 0 };
     ALL.forEach(function (a) { if (state.items[a.id]) counts[state.items[a.id]]++; });
     L.push('Checklist: ' + counts.ok + ' works, ' + counts.bad + ' problems, ' + counts.skip + ' skipped, ' + (ALL.length - counts.ok - counts.bad - counts.skip) + ' not tried');
+    var withPhotos = sentPhotoIds(), nPhotos = withPhotos.reduce(function (n, id) { return n + photos[id].length; }, 0);
+    if (nPhotos && !attached) {
+      L.push('', 'PHOTOS NOT ATTACHED', 'Please text me your ' + nPhotos + (nPhotos === 1 ? ' photo' : ' photos') + ' for:');
+      withPhotos.forEach(function (id) {
+        var a = ALL.filter(function (x) { return x.id === id; })[0];
+        L.push('- ' + (a ? a.group.title + ' / ' + a.what : 'Other photos') + ' (' + photos[id].length + ')');
+      });
+    }
+    function photoLine(id) { var n = photoNames(id); if (n.length) L.push('  Photos: ' + n.join(', ') + (attached ? '' : ' (not attached)')); }
     var problems = ALL.filter(function (a) { return state.items[a.id] === 'bad'; });
     if (problems.length) {
       L.push('', 'PROBLEMS');
-      problems.forEach(function (a) { L.push('- ' + a.group.title + ' / ' + a.what + ': ' + ((state.notes[a.id] || '').trim() || '(no details)')); });
+      problems.forEach(function (a) { L.push('- ' + a.group.title + ' / ' + a.what + ': ' + ((state.notes[a.id] || '').trim() || '(no details)')); photoLine(a.id); });
+    }
+    var works = ALL.filter(function (a) { return state.items[a.id] === 'ok' && ((state.notes[a.id] || '').trim() || (photos[a.id] || []).length); });
+    if (works.length) {
+      L.push('', 'WORKS, WITH NOTES');
+      works.forEach(function (a) { L.push('- ' + a.group.title + ' / ' + a.what + ': ' + ((state.notes[a.id] || '').trim() || '(no comment)')); photoLine(a.id); });
     }
     L.push('', 'CHECKLIST');
     GROUPS.forEach(function (g) {
@@ -421,54 +583,57 @@
     [['confusing', 'Confusing or slow'], ['missing', 'Missing'], ['love', 'Liked most'], ['other', 'Anything else']].forEach(function (p) {
       var t = (f[p[0]] || '').trim(); if (t) L.push('', p[1].toUpperCase(), t);
     });
+    if ((photos.other || []).length) { L.push('', 'OTHER PHOTOS'); photoLine('other'); }
     L.push('', 'Sent ' + new Date().toISOString().slice(0, 16).replace('T', ' ') + ' UTC');
     return L.join('\n');
   }
 
   var status = document.getElementById('status'), pre = document.getElementById('report');
   function fileName() { return 'liberalitas-feedback-' + ((state.fields.name || 'tester').trim().replace(/[^A-Za-z0-9]+/g, '-').toLowerCase() || 'tester') + '.txt'; }
-  function showText(msg) { pre.textContent = report(); pre.hidden = false; status.textContent = msg; }
+  function showText(msg) { pre.textContent = report(false); pre.hidden = false; status.textContent = msg; }
+  function textThem() { return sentPhotoIds().length ? ' Your photos aren\'t attached this way: please text them to me.' : ''; }
 
+  // Everything Send needs is already in memory, so the share sheet opens straight from the tap.
   document.getElementById('send').addEventListener('click', function () {
-    var text = report();
-    var shots = Array.prototype.slice.call(document.getElementById('f-shots').files || []);
+    var withFiles = report(true), plain = report(false);
     var files = [];
-    try { files = [new File([text], fileName(), { type: 'text/plain' })].concat(shots); } catch (e) {}
-    var data = { title: 'Liberalitas alpha feedback', text: text };
+    try { files = [new File([withFiles], fileName(), { type: 'text/plain' })].concat(photoFiles()); } catch (e) {}
+    var data = { title: 'Liberalitas alpha feedback', text: plain };
     if (navigator.share) {
-      if (files.length && navigator.canShare && navigator.canShare({ files: files })) data = { title: data.title, text: text, files: files };
-      navigator.share(data).then(function () { status.textContent = 'Sent. Thank you!'; }).catch(function (e) {
+      if (files.length && navigator.canShare && navigator.canShare({ files: files })) data = { title: data.title, text: withFiles, files: files };
+      var sentPhotos = !!data.files;
+      navigator.share(data).then(function () { status.textContent = 'Sent. Thank you!' + (sentPhotos ? '' : textThem()); }).catch(function (e) {
         if (e && e.name === 'AbortError') return;
-        fallback(text);
+        fallback(plain);
       });
-    } else fallback(text);
+    } else fallback(plain);
   });
   function fallback(text) {
     if (FEEDBACK_TO && FEEDBACK_TO.indexOf('@') > 0) {
-      showText('Your email app should open with everything filled in. If it doesn\'t, copy the text below and email it to me at ' + FEEDBACK_TO + '.');
+      showText('Your email app should open with everything filled in. If it doesn\'t, copy the text below and email it to me at ' + FEEDBACK_TO + '.' + textThem());
       location.href = 'mailto:' + FEEDBACK_TO + '?subject=' + encodeURIComponent('Liberalitas alpha feedback') + '&body=' + encodeURIComponent(text);
     } else {
-      showText('Your browser can\'t open the share menu. Copy the text below and text or email it to me.');
+      showText('Your browser can\'t open the share menu. Copy the text below and text or email it to me.' + textThem());
     }
   }
 
   document.getElementById('copy').addEventListener('click', function () {
-    var text = report();
-    var done = function () { status.textContent = 'Copied. Paste it into a text or email to me.'; };
+    var text = report(false);
+    var done = function () { status.textContent = 'Copied. Paste it into a text or email to me.' + textThem(); };
     if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done, function () { selectReport(); });
     else selectReport();
   });
   function selectReport() {
-    showText('Select the text below and copy it.');
+    showText('Select the text below and copy it.' + textThem());
     var r = document.createRange(); r.selectNodeContents(pre); var s = getSelection(); s.removeAllRanges(); s.addRange(r);
   }
 
   document.getElementById('download').addEventListener('click', function () {
     try {
-      var url = URL.createObjectURL(new Blob([report()], { type: 'text/plain' }));
+      var url = URL.createObjectURL(new Blob([report(false)], { type: 'text/plain' }));
       var a = document.createElement('a'); a.href = url; a.download = fileName(); document.body.appendChild(a); a.click(); a.remove();
       setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
-      status.textContent = 'Saved as ' + fileName() + ' in your downloads.';
+      status.textContent = 'Saved as ' + fileName() + ' in your downloads.' + textThem();
     } catch (e) { selectReport(); }
   });
 
@@ -477,12 +642,13 @@
   function askReset() {
     resetArea.innerHTML = '';
     var box = document.createElement('div'); box.className = 'confirm';
-    var t = document.createElement('span'); t.textContent = 'Clear every answer on this page?';
+    var t = document.createElement('span'); t.textContent = 'Clear every answer and photo on this page?';
     var yes = document.createElement('button'); yes.type = 'button'; yes.textContent = 'Clear';
     var no = document.createElement('button'); no.type = 'button'; no.className = 'no'; no.textContent = 'Keep';
     yes.addEventListener('click', function () {
-      state = { items: {}, notes: {}, rating: 0, fields: {} };
+      state = fresh();
       try { localStorage.removeItem(KEY); } catch (e) {}
+      clearPhotos();
       Object.keys(FIELDS).forEach(function (k) { document.getElementById(FIELDS[k]).value = ''; });
       document.querySelectorAll('.item textarea').forEach(function (ta) { ta.value = ''; });
       pre.hidden = true; status.textContent = 'Cleared.'; paint(); restoreReset();
@@ -501,6 +667,7 @@
   ALL.forEach(function (a) { var ta = document.getElementById('n-' + a.id.replace('.', '-')); if (ta) ta.value = state.notes[a.id] || ''; });
   Object.keys(FIELDS).forEach(function (k) { document.getElementById(FIELDS[k]).value = state.fields[k] || ''; });
   paint();
+  loadPhotos();
 })();
 </script>
 </body>
